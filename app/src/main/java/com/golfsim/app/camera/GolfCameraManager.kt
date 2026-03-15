@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.PointF
 import android.hardware.camera2.CaptureRequest
-import android.util.Log
 import android.util.Range
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.*
@@ -17,37 +16,32 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.*
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sign
+import kotlin.math.sqrt
+import kotlin.math.tan
 
-/**
- * GolfCameraManager — CameraX + enhanced ball detection.
- *
- * All improvements are internal; the public API is identical to the original:
- *   startCamera(previewView, lifecycleOwner, onBallDetected?)
- *   startCapturing() / stopCapturing(): List<BallPosition> / resetTracking()
- *   TrackingState sealed class (same variants including AnalyzingShot + Error)
- *
- * Improvements:
- * ─ Adaptive brightness window (threshold ±20) → tolerates lighting drift.
- * ─ Luminance-weighted sub-pixel centroid per blob.
- * ─ Multi-frame velocity window (8 frames) reduces noise.
- * ─ Acceleration-based spin estimation via Magnus force back-calculation.
- * ─ Kalman filter with full 4-state covariance matrix.
- * ─ Gap recovery: coasts up to 4 frames on Kalman prediction.
- * ─ ShotDataSnapshot emitted on swing for the physics engine.
- */
 class GolfCameraManager(private val context: Context) {
 
     companion object {
-        private const val TAG = "GolfCamera"
-        private const val TARGET_FPS = 60
-        private const val FRAME_HISTORY_SIZE = 120
-        private const val VELOCITY_WINDOW = 8
-        private const val MAX_GAP_FRAMES = 4
+        private const val TARGET_FPS = 120
+        private const val FRAME_HISTORY_SIZE = 160
+        private const val VELOCITY_WINDOW = 10
+        private const val MAX_GAP_FRAMES = 5
         private const val CAMERA_HFOV_DEG = 77.0
+
+        private const val DOWNSAMPLE = 2
+        private const val BG_ALPHA = 0.06f
+        private const val MOTION_MIN_DELTA = 14f
+        private const val LUMA_PERCENTILE = 0.84f
     }
 
-    // ─── Public flows ────────────────────────────────────────────────────────
     private val _trackingState = MutableStateFlow<TrackingState>(TrackingState.Idle)
     val trackingState: StateFlow<TrackingState> = _trackingState
 
@@ -63,11 +57,9 @@ class GolfCameraManager(private val context: Context) {
     private val _ballRadius = MutableStateFlow(0f)
     val ballRadius: StateFlow<Float> = _ballRadius
 
-    /** Populated on swing confirmation — consumed by physics engine. */
     private val _shotSnapshot = MutableStateFlow<ShotDataSnapshot?>(null)
     val shotSnapshot: StateFlow<ShotDataSnapshot?> = _shotSnapshot
 
-    // ─── TrackingState (identical to original) ───────────────────────────────
     sealed class TrackingState {
         object Idle : TrackingState()
         object WaitingForBall : TrackingState()
@@ -77,7 +69,6 @@ class GolfCameraManager(private val context: Context) {
         data class Error(val message: String) : TrackingState()
     }
 
-    // ─── Internal state ──────────────────────────────────────────────────────
     @Volatile private var profile = CalibrationProfile()
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -92,20 +83,27 @@ class GolfCameraManager(private val context: Context) {
     @Volatile private var lastFrameWidth = 1920
     @Volatile private var lastFrameHeight = 1080
 
-    // FPS tracking (same pattern as original)
-    private val frameTimestamps = ArrayDeque<Long>(70)
+    private val frameTimestamps = ArrayDeque<Long>(128)
 
-    // Kalman filter state
-    private var kalmanX = 0f; private var kalmanY = 0f
-    private var kalmanVx = 0f; private var kalmanVy = 0f
+    private var downWidth = 0
+    private var downHeight = 0
+    private var backgroundLuma = FloatArray(0)
+    private var currentLuma = FloatArray(0)
+    private var motionMask = BooleanArray(0)
+    private var brightMask = BooleanArray(0)
+
+    private var kalmanX = 0f
+    private var kalmanY = 0f
+    private var kalmanVx = 0f
+    private var kalmanVy = 0f
     private var kalmanInitialized = false
     private var kalmanP = Array(4) { i -> FloatArray(4) { j -> if (i == j) 100f else 0f } }
-    private val processNoise = 8f
-    private val measureNoise = 6f
+    private val processNoise = 4f
+    private val measureNoise = 8f
 
-    // ─── Public API (matches original exactly) ───────────────────────────────
-
-    fun updateCalibration(newProfile: CalibrationProfile) { profile = newProfile }
+    fun updateCalibration(newProfile: CalibrationProfile) {
+        profile = newProfile
+    }
 
     fun setManualBallHint(normX: Float, normY: Float) {
         profile = profile.copy(manualHintX = normX, manualHintY = normY, useManualHint = true)
@@ -113,21 +111,21 @@ class GolfCameraManager(private val context: Context) {
 
     suspend fun autoDetectBrightness(): Int {
         val frame = lastYData ?: return 200
-        val width = lastFrameWidth; val height = lastFrameHeight
-        var maxLuma = 0
-        for (y in height / 4 until height * 3 / 4 step 4) {
-            for (x in width / 4 until width * 3 / 4 step 4) {
-                val idx = y * width + x
-                if (idx < frame.size) {
-                    val luma = frame[idx].toInt() and 0xFF
-                    if (luma > maxLuma) maxLuma = luma
+        val width = lastFrameWidth
+        val height = lastFrameHeight
+        var peak = 0
+
+        for (y in height / 5 until (height * 4) / 5 step 3) {
+            for (x in width / 5 until (width * 4) / 5 step 3) {
+                val index = y * width + x
+                if (index < frame.size) {
+                    peak = max(peak, frame[index].toInt() and 0xFF)
                 }
             }
         }
-        return (maxLuma * 0.80).toInt().coerceIn(150, 245)
+        return (peak * 0.78f).toInt().coerceIn(130, 245)
     }
 
-    /** Same signature as original: startCamera(previewView, lifecycleOwner, onBallDetected?) */
     @SuppressLint("UnsafeOptInUsageError")
     fun startCamera(
         previewView: PreviewView,
@@ -142,12 +140,13 @@ class GolfCameraManager(private val context: Context) {
             Camera2Interop.Extender(previewBuilder).apply {
                 setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS))
                 setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
-                setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
                 setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0.35f)
-                setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, 4_000_000L)
+                setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_LOCKED)
+                setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, 1_000_000L)
             }
+
             val preview = previewBuilder.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
             val analysisBuilder = ImageAnalysis.Builder()
@@ -158,13 +157,17 @@ class GolfCameraManager(private val context: Context) {
                 .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS))
 
             val analyzer = analysisBuilder.build().also {
-                it.setAnalyzer(cameraExecutor) { img -> processFrame(img, onBallDetected) }
+                it.setAnalyzer(cameraExecutor) { frame -> processFrame(frame, onBallDetected) }
             }
 
-            val selector = CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
             try {
                 cameraProvider?.unbindAll()
-                cameraProvider?.bindToLifecycle(lifecycleOwner, selector, preview, analyzer)
+                cameraProvider?.bindToLifecycle(
+                    lifecycleOwner,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    analyzer
+                )
                 _trackingState.value = TrackingState.WaitingForBall
             } catch (e: Exception) {
                 _trackingState.value = TrackingState.Error("Camera failed: ${e.message}")
@@ -172,10 +175,10 @@ class GolfCameraManager(private val context: Context) {
         }, ContextCompat.getMainExecutor(context))
     }
 
-    /** Matches original */
     fun startCapturing() {
         synchronized(ballHistory) { ballHistory.clear() }
-        motionFrameCount = 0; gapFrameCount = 0
+        motionFrameCount = 0
+        gapFrameCount = 0
         kalmanInitialized = false
         _swingDetected.value = false
         _shotSnapshot.value = null
@@ -183,17 +186,16 @@ class GolfCameraManager(private val context: Context) {
         _trackingState.value = TrackingState.WaitingForBall
     }
 
-    /** Matches original: returns captured positions */
     fun stopCapturing(): List<BallPosition> {
         isCapturing = false
         _trackingState.value = TrackingState.AnalyzingShot
         return synchronized(ballHistory) { ballHistory.toList() }
     }
 
-    /** Matches original */
     fun resetTracking() {
         synchronized(ballHistory) { ballHistory.clear() }
-        motionFrameCount = 0; gapFrameCount = 0
+        motionFrameCount = 0
+        gapFrameCount = 0
         kalmanInitialized = false
         _swingDetected.value = false
         _detectedBallPositions.value = emptyList()
@@ -201,211 +203,333 @@ class GolfCameraManager(private val context: Context) {
         _trackingState.value = TrackingState.WaitingForBall
     }
 
-    fun shutdown() { cameraExecutor.shutdown(); cameraProvider?.unbindAll() }
-
-    // ─── Frame processing ────────────────────────────────────────────────────
+    fun shutdown() {
+        cameraExecutor.shutdown()
+        cameraProvider?.unbindAll()
+    }
 
     @SuppressLint("UnsafeOptInUsageError")
     private fun processFrame(imageProxy: ImageProxy, onBallDetected: ((BallPosition) -> Unit)?) {
         val now = System.currentTimeMillis()
         updateFps(now)
 
-        val image = imageProxy.image
-        if (image == null) { imageProxy.close(); return }
+        val image = imageProxy.image ?: run {
+            imageProxy.close()
+            return
+        }
 
-        val width = imageProxy.width; val height = imageProxy.height
-        lastFrameWidth = width; lastFrameHeight = height
+        val width = imageProxy.width
+        val height = imageProxy.height
+        lastFrameWidth = width
+        lastFrameHeight = height
 
-        val yPlane = image.planes[0]
-        val yBuffer = yPlane.buffer
-        val rowStride = yPlane.rowStride; val pixelStride = yPlane.pixelStride
-        val yData = ByteArray(yBuffer.remaining()).also { yBuffer.get(it) }
+        val plane = image.planes[0]
+        val yData = ByteArray(plane.buffer.remaining()).also { plane.buffer.get(it) }
         lastYData = yData
 
-        val detected = detectBall(yData, width, height, rowStride, pixelStride)
+        ensureBuffers(width, height)
+        buildLumaMaps(yData, plane.rowStride, plane.pixelStride)
 
-        if (detected != null) {
+        val candidate = detectBallCandidate(width, height)
+        if (candidate != null) {
             gapFrameCount = 0
-            val smoothed = kalmanUpdate(detected.cx, detected.cy)
-            val ballPos = BallPosition(smoothed.x, smoothed.y, now)
+            val filtered = kalmanUpdate(candidate.cx, candidate.cy)
+            val pos = BallPosition(filtered.x, filtered.y, now)
 
             if (isCapturing) {
                 synchronized(ballHistory) {
-                    ballHistory.add(ballPos)
+                    ballHistory.add(pos)
                     if (ballHistory.size > FRAME_HISTORY_SIZE) ballHistory.removeAt(0)
                 }
                 _detectedBallPositions.value = synchronized(ballHistory) { ballHistory.toList() }
-                onBallDetected?.invoke(ballPos)
+                onBallDetected?.invoke(pos)
                 checkForSwing()
             }
 
-            _ballRadius.value = detected.radius
-            _trackingState.value = TrackingState.BallDetected(smoothed.x, smoothed.y, detected.radius, detected.confidence)
+            _ballRadius.value = candidate.radius
+            _trackingState.value = TrackingState.BallDetected(filtered.x, filtered.y, candidate.radius, candidate.confidence)
         } else {
-            // Gap recovery: coast on Kalman
             if (kalmanInitialized && gapFrameCount < MAX_GAP_FRAMES) {
                 gapFrameCount++
-                kalmanX += kalmanVx; kalmanY += kalmanVy
-                val coasted = BallPosition(kalmanX, kalmanY, now)
-                if (isCapturing) synchronized(ballHistory) { ballHistory.add(coasted) }
-                _trackingState.value = TrackingState.BallDetected(kalmanX, kalmanY, _ballRadius.value, 0.25f)
+                kalmanX += kalmanVx
+                kalmanY += kalmanVy
+                val predicted = BallPosition(kalmanX, kalmanY, now)
+                if (isCapturing) synchronized(ballHistory) { ballHistory.add(predicted) }
+                _trackingState.value = TrackingState.BallDetected(kalmanX, kalmanY, _ballRadius.value, 0.20f)
             } else {
                 kalmanInitialized = false
                 if (!isCapturing) _trackingState.value = TrackingState.WaitingForBall
             }
         }
-
         imageProxy.close()
     }
 
-    // ─── Enhanced blob detection ─────────────────────────────────────────────
+    private fun ensureBuffers(width: Int, height: Int) {
+        val targetW = width / DOWNSAMPLE
+        val targetH = height / DOWNSAMPLE
+        if (targetW == downWidth && targetH == downHeight) return
 
-    private data class Blob(
-        val cx: Float, val cy: Float, val radius: Float,
-        val pixelCount: Int, val circularity: Float, val avgLuma: Float, val confidence: Float
+        downWidth = targetW
+        downHeight = targetH
+        val size = downWidth * downHeight
+        backgroundLuma = FloatArray(size)
+        currentLuma = FloatArray(size)
+        motionMask = BooleanArray(size)
+        brightMask = BooleanArray(size)
+        kalmanInitialized = false
+    }
+
+    private fun buildLumaMaps(yData: ByteArray, rowStride: Int, pixelStride: Int) {
+        if (downWidth == 0 || downHeight == 0) return
+
+        var offset = 0
+        val histogram = IntArray(256)
+
+        for (y in 0 until downHeight) {
+            val srcY = y * DOWNSAMPLE
+            for (x in 0 until downWidth) {
+                val srcX = x * DOWNSAMPLE
+                val rawIndex = srcY * rowStride + srcX * pixelStride
+                val luma = if (rawIndex < yData.size) (yData[rawIndex].toInt() and 0xFF).toFloat() else 0f
+                currentLuma[offset] = luma
+                histogram[luma.toInt().coerceIn(0, 255)]++
+                offset++
+            }
+        }
+
+        val percentileLuma = percentile(histogram, (downWidth * downHeight * LUMA_PERCENTILE).toInt())
+        val brightnessCutoff = max(profile.brightnessThreshold.toFloat(), percentileLuma)
+
+        for (i in currentLuma.indices) {
+            if (backgroundLuma[i] == 0f) backgroundLuma[i] = currentLuma[i]
+            val delta = abs(currentLuma[i] - backgroundLuma[i])
+            motionMask[i] = delta >= MOTION_MIN_DELTA
+            brightMask[i] = currentLuma[i] >= brightnessCutoff
+            backgroundLuma[i] = backgroundLuma[i] * (1f - BG_ALPHA) + currentLuma[i] * BG_ALPHA
+        }
+    }
+
+    private fun percentile(hist: IntArray, targetCount: Int): Float {
+        var cumulative = 0
+        for (i in hist.indices) {
+            cumulative += hist[i]
+            if (cumulative >= targetCount) return i.toFloat()
+        }
+        return 255f
+    }
+
+    private data class Candidate(
+        val cx: Float,
+        val cy: Float,
+        val radius: Float,
+        val area: Float,
+        val circularity: Float,
+        val contrast: Float,
+        val confidence: Float
     )
 
-    private fun detectBall(yData: ByteArray, width: Int, height: Int, rowStride: Int, pixelStride: Int): Blob? {
-        val p = profile
-        val adaptiveLow = (p.brightnessThreshold - 20).coerceAtLeast(100)
-        val step = 2
+    private fun detectBallCandidate(frameWidth: Int, frameHeight: Int): Candidate? {
+        val size = downWidth * downHeight
+        if (size <= 0) return null
 
-        val brightMap = BooleanArray(width * height)
-        for (y in height / 10 until height * 9 / 10 step step) {
-            for (x in width / 10 until width * 9 / 10 step step) {
-                val idx = y * rowStride + x * pixelStride
-                if (idx < yData.size && (yData[idx].toInt() and 0xFF) >= adaptiveLow) {
-                    brightMap[y * width + x] = true
-                }
+        val visited = BooleanArray(size)
+        val candidates = ArrayList<Candidate>()
+
+        val minAreaDown = (profile.minBallRadius * profile.minBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 0.4f
+        val maxAreaDown = (profile.maxBallRadius * profile.maxBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 1.8f
+
+        for (y in 1 until downHeight - 1) {
+            for (x in 1 until downWidth - 1) {
+                val idx = y * downWidth + x
+                if (visited[idx] || !brightMask[idx]) continue
+
+                val blob = collectComponent(x, y, visited, minAreaDown, maxAreaDown)
+                if (blob != null) candidates.add(blob)
             }
         }
 
-        val hintX = if (p.useManualHint) (p.manualHintX * width).toInt() else -1
-        val hintY = if (p.useManualHint) (p.manualHintY * height).toInt() else -1
+        if (candidates.isEmpty()) return null
 
-        val visited = BooleanArray(width * height)
-        val blobs = mutableListOf<Blob>()
-
-        for (y in height / 10 until height * 9 / 10 step step) {
-            for (x in width / 10 until width * 9 / 10 step step) {
-                val idx = y * width + x
-                if (brightMap[idx] && !visited[idx]) {
-                    floodFill(yData, brightMap, visited, x, y, width, height, rowStride, pixelStride, step, p)
-                        ?.let { blobs.add(it) }
-                }
-            }
-        }
-
-        val valid = blobs.filter {
-            it.circularity >= p.circularityThreshold
-                && it.radius >= p.minBallRadius
-                && it.radius <= p.maxBallRadius
-                && it.avgLuma >= p.brightnessThreshold
-        }
-        if (valid.isEmpty()) return null
+        val hintedX = if (profile.useManualHint) profile.manualHintX * frameWidth else null
+        val hintedY = if (profile.useManualHint) profile.manualHintY * frameHeight else null
 
         return when {
             kalmanInitialized -> {
-                val predX = kalmanX + kalmanVx; val predY = kalmanY + kalmanVy
-                valid.minByOrNull { b -> val dx = b.cx - predX; val dy = b.cy - predY; sqrt((dx*dx+dy*dy).toDouble()).toFloat() }
-            }
-            hintX >= 0 -> valid.minByOrNull { b -> val dx = b.cx - hintX; val dy = b.cy - hintY; sqrt((dx*dx+dy*dy).toDouble()).toFloat() }
-            else -> {
-                val cx = width / 2f; val cy = height / 2f
-                val diag = sqrt((width * width + height * height).toDouble()).toFloat()
-                valid.maxByOrNull { b ->
-                    val dx = b.cx - cx; val dy = b.cy - cy
-                    b.confidence - (sqrt((dx*dx+dy*dy).toDouble()).toFloat() / diag) * 0.4f
+                val predX = kalmanX + kalmanVx
+                val predY = kalmanY + kalmanVy
+                candidates.maxByOrNull { c ->
+                    val distancePenalty = (hypot((c.cx - predX).toDouble(), (c.cy - predY).toDouble()) / frameWidth).toFloat()
+                    c.confidence - distancePenalty
                 }
             }
+            hintedX != null && hintedY != null -> {
+                candidates.maxByOrNull { c ->
+                    val distancePenalty = (hypot((c.cx - hintedX).toDouble(), (c.cy - hintedY).toDouble()) / frameWidth).toFloat()
+                    c.confidence - distancePenalty * 0.5f
+                }
+            }
+            else -> candidates.maxByOrNull { it.confidence }
         }
     }
 
-    private fun floodFill(
-        yData: ByteArray, brightMap: BooleanArray, visited: BooleanArray,
-        startX: Int, startY: Int, width: Int, height: Int,
-        rowStride: Int, pixelStride: Int, step: Int, p: CalibrationProfile
-    ): Blob? {
+    private fun collectComponent(
+        seedX: Int,
+        seedY: Int,
+        visited: BooleanArray,
+        minArea: Float,
+        maxArea: Float
+    ): Candidate? {
         val stack = ArrayDeque<Int>()
-        val seed = startY * width + startX
-        stack.addLast(seed); visited[seed] = true
+        val seed = seedY * downWidth + seedX
+        stack.add(seed)
+        visited[seed] = true
 
-        var minX = startX; var maxX = startX; var minY = startY; var maxY = startY
-        var sumX = 0.0; var sumY = 0.0; var sumW = 0.0
-        var sumLuma = 0L; var count = 0
+        var pixelCount = 0
+        var edgeCount = 0
+        var sumX = 0.0
+        var sumY = 0.0
+        var weightedX = 0.0
+        var weightedY = 0.0
+        var weightSum = 0.0
+        var lumaSum = 0.0
+        var bgSum = 0.0
+
+        var minX = seedX
+        var maxX = seedX
+        var minY = seedY
+        var maxY = seedY
 
         while (stack.isNotEmpty()) {
-            val cur = stack.removeLast()
-            val cx = cur % width; val cy = cur / width
-            val raw = cy * rowStride + cx * pixelStride
-            val luma = if (raw < yData.size) (yData[raw].toInt() and 0xFF).toDouble() else 0.0
+            val idx = stack.removeLast()
+            val x = idx % downWidth
+            val y = idx / downWidth
+            val luma = currentLuma[idx].toDouble()
+            val bg = backgroundLuma[idx].toDouble()
 
-            sumX += cx * luma; sumY += cy * luma; sumW += luma
-            sumLuma += luma.toLong(); count++
-            if (cx < minX) minX = cx; if (cx > maxX) maxX = cx
-            if (cy < minY) minY = cy; if (cy > maxY) maxY = cy
+            pixelCount++
+            sumX += x
+            sumY += y
+            weightedX += x * luma
+            weightedY += y * luma
+            weightSum += luma
+            lumaSum += luma
+            bgSum += bg
+            minX = min(minX, x)
+            maxX = max(maxX, x)
+            minY = min(minY, y)
+            maxY = max(maxY, y)
 
-            for ((nx, ny) in listOf(cx + step to cy, cx - step to cy, cx to cy + step, cx to cy - step)) {
-                if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue
-                val ni = ny * width + nx
-                if (!visited[ni] && brightMap[ni]) { visited[ni] = true; stack.addLast(ni) }
+            var exposedSides = 0
+            for (ny in y - 1..y + 1) {
+                for (nx in x - 1..x + 1) {
+                    if (nx == x && ny == y) continue
+                    if (nx !in 0 until downWidth || ny !in 0 until downHeight) {
+                        exposedSides++
+                        continue
+                    }
+                    val nIdx = ny * downWidth + nx
+                    val active = brightMask[nIdx] && motionMask[nIdx]
+                    if (!active) exposedSides++
+                    if (!visited[nIdx] && active) {
+                        visited[nIdx] = true
+                        stack.add(nIdx)
+                    }
+                }
+            }
+            if (exposedSides > 0) edgeCount += exposedSides
+        }
+
+        val area = pixelCount.toFloat()
+        if (area !in minArea..maxArea) return null
+
+        val centerXDown = if (weightSum > 0.0) (weightedX / weightSum).toFloat() else (sumX / pixelCount).toFloat()
+        val centerYDown = if (weightSum > 0.0) (weightedY / weightSum).toFloat() else (sumY / pixelCount).toFloat()
+        val radiusDown = sqrt((area / PI).toDouble()).toFloat()
+
+        val perimeter = max(1f, edgeCount / 2f)
+        val circularity = ((4f * PI.toFloat() * area) / (perimeter * perimeter)).coerceIn(0f, 1.2f)
+        if (circularity < profile.circularityThreshold * 0.85f) return null
+
+        val bboxW = maxX - minX + 1
+        val bboxH = maxY - minY + 1
+        val aspectPenalty = abs((bboxW.toFloat() / max(1, bboxH)) - 1f)
+
+        val contrast = ((lumaSum / pixelCount) - (bgSum / pixelCount)).toFloat().coerceAtLeast(0f)
+        val contrastScore = (contrast / 40f).coerceIn(0f, 1f)
+        val roundnessScore = (1f - min(1f, aspectPenalty + abs(circularity - 1f) * 0.7f)).coerceIn(0f, 1f)
+
+        var motionFraction = 0f
+        for (y in minY..maxY) {
+            for (x in minX..maxX) {
+                val idx = y * downWidth + x
+                if (brightMask[idx] && motionMask[idx]) motionFraction += 1f
             }
         }
-        if (count < 4) return null
+        val motionScore = (motionFraction / max(1f, bboxW * bboxH.toFloat())).coerceIn(0f, 1f)
 
-        val centX = (if (sumW > 0) sumX / sumW else startX.toDouble()).toFloat()
-        val centY = (if (sumW > 0) sumY / sumW else startY.toDouble()).toFloat()
-        val radius = ((maxX - minX + maxY - minY) / 4f).coerceAtLeast(1f)
-        // count is subsampled by step in both X and Y, so multiply by step² to approximate true area
-        val area = count.toFloat() * (step * step)
-        val perim = 2f * PI.toFloat() * radius
-        val circularity = ((4f * PI.toFloat() * area) / (perim * perim)).coerceIn(0f, 1f)
-        val avgLuma = (sumLuma / count).toFloat()
-        val lumaConf = ((avgLuma - p.brightnessThreshold) / (255f - p.brightnessThreshold)).coerceIn(0f, 1f)
-        val confidence = (circularity * 0.6f + lumaConf * 0.4f).coerceIn(0f, 1f)
+        val confidence = (roundnessScore * 0.45f + contrastScore * 0.35f + motionScore * 0.20f).coerceIn(0f, 1f)
 
-        return Blob(centX, centY, radius, count, circularity, avgLuma, confidence)
+        val fullX = centerXDown * DOWNSAMPLE
+        val fullY = centerYDown * DOWNSAMPLE
+        val fullRadius = radiusDown * DOWNSAMPLE
+
+        return Candidate(fullX, fullY, fullRadius, area * DOWNSAMPLE * DOWNSAMPLE, circularity, contrast, confidence)
     }
-
-    // ─── Kalman filter ───────────────────────────────────────────────────────
 
     private fun kalmanUpdate(measX: Float, measY: Float): PointF {
         if (!kalmanInitialized) {
-            kalmanX = measX; kalmanY = measY; kalmanVx = 0f; kalmanVy = 0f
+            kalmanX = measX
+            kalmanY = measY
+            kalmanVx = 0f
+            kalmanVy = 0f
             kalmanP = Array(4) { i -> FloatArray(4) { j -> if (i == j) 100f else 0f } }
             kalmanInitialized = true
             return PointF(measX, measY)
         }
-        val pX = kalmanX + kalmanVx; val pY = kalmanY + kalmanVy
-        kalmanP[0][0] += processNoise; kalmanP[1][1] += processNoise
-        kalmanP[2][2] += processNoise * 0.5f; kalmanP[3][3] += processNoise * 0.5f
 
-        val kx  = kalmanP[0][0] / (kalmanP[0][0] + measureNoise)
-        val ky  = kalmanP[1][1] / (kalmanP[1][1] + measureNoise)
-        val kvx = kalmanP[2][2] / (kalmanP[2][2] + measureNoise * 2f)
-        val kvy = kalmanP[3][3] / (kalmanP[3][3] + measureNoise * 2f)
+        val pX = kalmanX + kalmanVx
+        val pY = kalmanY + kalmanVy
 
-        val dx = measX - pX; val dy = measY - pY
-        kalmanX = pX + kx * dx; kalmanY = pY + ky * dy
-        kalmanVx += kvx * dx;   kalmanVy += kvy * dy
-        kalmanP[0][0] *= (1f - kx);  kalmanP[1][1] *= (1f - ky)
-        kalmanP[2][2] *= (1f - kvx); kalmanP[3][3] *= (1f - kvy)
+        kalmanP[0][0] += processNoise
+        kalmanP[1][1] += processNoise
+        kalmanP[2][2] += processNoise * 0.4f
+        kalmanP[3][3] += processNoise * 0.4f
+
+        val kx = kalmanP[0][0] / (kalmanP[0][0] + measureNoise)
+        val ky = kalmanP[1][1] / (kalmanP[1][1] + measureNoise)
+        val kvx = kalmanP[2][2] / (kalmanP[2][2] + measureNoise * 1.8f)
+        val kvy = kalmanP[3][3] / (kalmanP[3][3] + measureNoise * 1.8f)
+
+        val dx = measX - pX
+        val dy = measY - pY
+
+        kalmanX = pX + kx * dx
+        kalmanY = pY + ky * dy
+        kalmanVx += kvx * dx
+        kalmanVy += kvy * dy
+
+        kalmanP[0][0] *= (1f - kx)
+        kalmanP[1][1] *= (1f - ky)
+        kalmanP[2][2] *= (1f - kvx)
+        kalmanP[3][3] *= (1f - kvy)
 
         return PointF(kalmanX, kalmanY)
     }
 
-    // ─── Swing detection ─────────────────────────────────────────────────────
-
     private fun checkForSwing() {
         val history = synchronized(ballHistory) { ballHistory.toList() }
-        if (history.size < 3) return
-        val last = history[history.size - 1]; val prev = history[history.size - 3]
-        val dtMs = (last.timestamp - prev.timestamp).toFloat()
-        if (dtMs <= 0f) return
-        val dx = last.x - prev.x; val dy = last.y - prev.y
-        val speedPxPerFrame = sqrt(dx * dx + dy * dy) / dtMs * (1000f / TARGET_FPS)
+        if (history.size < 4) return
 
-        if (speedPxPerFrame >= profile.swingMotionThresholdPx) motionFrameCount++ else motionFrameCount = 0
+        val latest = history.last()
+        val compare = history[history.size - 4]
+        val dtMs = (latest.timestamp - compare.timestamp).toFloat()
+        if (dtMs <= 0f) return
+
+        val dx = latest.x - compare.x
+        val dy = latest.y - compare.y
+        val speedPxPerFrame = (sqrt(dx * dx + dy * dy) / dtMs) * (1000f / TARGET_FPS)
+
+        motionFrameCount = if (speedPxPerFrame >= profile.swingMotionThresholdPx) motionFrameCount + 1 else 0
 
         if (motionFrameCount >= profile.swingConfirmFrames && !_swingDetected.value) {
             _swingDetected.value = true
@@ -415,60 +539,81 @@ class GolfCameraManager(private val context: Context) {
     }
 
     private fun buildShotSnapshot(history: List<BallPosition>): ShotDataSnapshot {
-        val w = lastFrameWidth.toDouble()
-        val yardsPerPx = (2.0 * (profile.cameraDistanceFeet / 3.0) * tan(Math.toRadians(CAMERA_HFOV_DEG / 2.0))) / w
-        val feetPerPx  = yardsPerPx * 3.0
+        val frameWidth = lastFrameWidth.toDouble()
+        val yardsPerPx = (2.0 * (profile.cameraDistanceFeet / 3.0) * tan(Math.toRadians(CAMERA_HFOV_DEG / 2.0))) / frameWidth
+        val feetPerPx = yardsPerPx * 3.0
 
         val window = history.takeLast(VELOCITY_WINDOW)
-        val dtSec  = (window.last().timestamp - window.first().timestamp) / 1000.0
+        if (window.size < 3) return ShotDataSnapshot.empty(profile)
+
+        val first = window.first()
+        val last = window.last()
+        val dtSec = (last.timestamp - first.timestamp) / 1000.0
         if (dtSec <= 0.0) return ShotDataSnapshot.empty(profile)
 
-        val dxPx = window.last().x - window.first().x
-        val dyPx = window.last().y - window.first().y
-        val speedXFps = (dxPx * feetPerPx) / dtSec
-        val speedYFps = -(dyPx * feetPerPx) / dtSec
-        val speedFps  = sqrt(speedXFps * speedXFps + speedYFps * speedYFps)
-        val ballSpeedMph = (speedFps / 1.46667).coerceIn(10.0, 220.0)
-        val launchAngleDeg = Math.toDegrees(atan2(speedYFps, abs(speedXFps))).coerceIn(0.0, 60.0)
+        val dxPx = last.x - first.x
+        val dyPx = last.y - first.y
 
-        var sumLatAccel = 0.0; var sumVertAccel = 0.0; var accelSamples = 0
-        for (i in 1 until window.size - 1) {
-            val a = window[i - 1]; val b = window[i]; val c = window[i + 1]
-            val dt1 = (b.timestamp - a.timestamp) / 1000.0
-            val dt2 = (c.timestamp - b.timestamp) / 1000.0
-            if (dt1 <= 0 || dt2 <= 0) continue
-            val vx1 = (b.x - a.x) * feetPerPx / dt1; val vy1 = -(b.y - a.y) * feetPerPx / dt1
-            val vx2 = (c.x - b.x) * feetPerPx / dt2; val vy2 = -(c.y - b.y) * feetPerPx / dt2
-            sumLatAccel  += (vx2 - vx1) / dt2; sumVertAccel += (vy2 - vy1) / dt2; accelSamples++
+        val vx = (dxPx * feetPerPx) / dtSec
+        val vy = -(dyPx * feetPerPx) / dtSec
+        val speedFps = hypot(vx, vy)
+        val ballSpeedMph = (speedFps / 1.46667).coerceIn(8.0, 230.0)
+        val launchAngleDeg = Math.toDegrees(atan2(vy, abs(vx))).coerceIn(0.0, 65.0)
+
+        var curvatureAccum = 0.0
+        var curvatureSamples = 0
+        for (i in 1 until window.lastIndex) {
+            val p0 = window[i - 1]
+            val p1 = window[i]
+            val p2 = window[i + 1]
+
+            val a = hypot((p1.x - p0.x).toDouble(), (p1.y - p0.y).toDouble())
+            val b = hypot((p2.x - p1.x).toDouble(), (p2.y - p1.y).toDouble())
+            val c = hypot((p2.x - p0.x).toDouble(), (p2.y - p0.y).toDouble())
+            if (a < 0.001 || b < 0.001 || c < 0.001) continue
+
+            val area2 = abs((p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x)).toDouble()
+            val curvature = (2.0 * area2) / (a * b * c)
+            val turn = sign(((p1.x - p0.x) * (p2.y - p1.y) - (p1.y - p0.y) * (p2.x - p1.x)).toDouble())
+            curvatureAccum += curvature * turn
+            curvatureSamples++
         }
-        val magnusK  = 0.000015
-        val backSpin = if (speedFps > 10 && accelSamples > 0) ((sumVertAccel / accelSamples) / (magnusK * speedFps)).coerceIn(0.0, 8000.0) else 0.0
-        val sideSpin = if (speedFps > 10 && accelSamples > 0) ((sumLatAccel  / accelSamples) / (magnusK * speedFps)).coerceIn(-2000.0, 2000.0) else 0.0
 
-        val swingPathDeg = if (abs(dxPx) > 2f) Math.toDegrees(atan2(-dyPx.toDouble(), dxPx.toDouble())) else 0.0
-        val detectionRate = (history.size.toFloat() / FRAME_HISTORY_SIZE * 100f).coerceIn(0f, 100f)
+        val avgCurvature = if (curvatureSamples > 0) curvatureAccum / curvatureSamples else 0.0
+        val spinScale = (ballSpeedMph / 160.0).coerceIn(0.35, 1.45)
+
+        val backspinRpm = (1800.0 + launchAngleDeg * 70.0 + speedFps.pow(0.9) * 6.0).coerceIn(1200.0, 8500.0)
+        val sidespinRpm = (avgCurvature * 65000.0 * spinScale).coerceIn(-3500.0, 3500.0)
+
+        val swingPathDeg = if (abs(dxPx) > 1f) Math.toDegrees(atan2(-dyPx.toDouble(), dxPx.toDouble())) else 0.0
+        val faceAngleDeg = (swingPathDeg * 0.6 + (sidespinRpm / 500.0)).coerceIn(-12.0, 12.0)
+
+        val detectionRate = (history.size.toFloat() / FRAME_HISTORY_SIZE.toFloat() * 100f).coerceIn(0f, 100f)
 
         return ShotDataSnapshot(
-            ballSpeedMph = ballSpeedMph, launchAngleDeg = launchAngleDeg,
-            swingPathDeg = swingPathDeg, faceAngleDeg = swingPathDeg * 0.6,
-            backspinRpm = backSpin, sidespinRpm = sideSpin,
-            estimatedCarryYards = 0.0, yardsPerPixel = yardsPerPx,
-            frameCount = history.size, detectionRatePct = detectionRate,
-            rawPositions = history, profile = profile
+            ballSpeedMph = ballSpeedMph,
+            launchAngleDeg = launchAngleDeg,
+            swingPathDeg = swingPathDeg,
+            faceAngleDeg = faceAngleDeg,
+            backspinRpm = backspinRpm,
+            sidespinRpm = sidespinRpm,
+            estimatedCarryYards = 0.0,
+            yardsPerPixel = yardsPerPx,
+            frameCount = history.size,
+            detectionRatePct = detectionRate,
+            rawPositions = history,
+            profile = profile
         )
     }
 
-    // ─── FPS ─────────────────────────────────────────────────────────────────
-
     private fun updateFps(now: Long) {
         frameTimestamps.addLast(now)
-        while (frameTimestamps.isNotEmpty() && now - frameTimestamps.first() > 1000L)
+        while (frameTimestamps.isNotEmpty() && now - frameTimestamps.first() > 1000L) {
             frameTimestamps.removeFirst()
+        }
         _fps.value = frameTimestamps.size.toFloat()
     }
 }
-
-// ─── ShotDataSnapshot ────────────────────────────────────────────────────────
 
 data class ShotDataSnapshot(
     val ballSpeedMph: Double,
@@ -481,12 +626,23 @@ data class ShotDataSnapshot(
     val yardsPerPixel: Double,
     val frameCount: Int,
     val detectionRatePct: Float,
-    val rawPositions: List<com.golfsim.app.models.BallPosition>,
+    val rawPositions: List<BallPosition>,
     val profile: CalibrationProfile
 ) {
     companion object {
         fun empty(profile: CalibrationProfile) = ShotDataSnapshot(
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0f, emptyList(), profile
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0f,
+            emptyList(),
+            profile
         )
     }
 }
