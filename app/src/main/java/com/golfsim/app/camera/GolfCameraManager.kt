@@ -16,10 +16,16 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.google.android.gms.tasks.Tasks
 import com.golfsim.app.models.BallPosition
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.ObjectDetector
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
@@ -97,6 +103,8 @@ class GolfCameraManager(private val context: Context) {
 
     private var cameraProvider: ProcessCameraProvider? = null
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var mlDetector: ObjectDetector? = null
+    private var mlDetectorEnabled = true
 
     private val ballHistory = mutableListOf<BallPosition>()
     private var isCapturing = false
@@ -170,6 +178,7 @@ class GolfCameraManager(private val context: Context) {
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             cameraProvider = future.get()
+            ensureMlDetector()
 
             val previewBuilder = Preview.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
@@ -264,6 +273,8 @@ class GolfCameraManager(private val context: Context) {
 
     fun shutdown() {
         cameraExecutor.shutdown()
+        mlDetector?.close()
+        mlDetector = null
         cameraProvider?.unbindAll()
     }
 
@@ -289,7 +300,9 @@ class GolfCameraManager(private val context: Context) {
         ensureBuffers(width, height)
         buildLumaMaps(yData, plane.rowStride, plane.pixelStride)
 
-        val candidate = detectBallCandidate(width, height)
+        val cvCandidate = detectBallCandidate(width, height)
+        val mlCandidate = detectMlKitCandidate(imageProxy)
+        val candidate = chooseBestCandidate(cvCandidate, mlCandidate)
         if (candidate != null) {
             gapFrameCount = 0
 
@@ -324,6 +337,103 @@ class GolfCameraManager(private val context: Context) {
         }
 
         imageProxy.close()
+    }
+
+    private fun ensureMlDetector() {
+        if (mlDetector != null || !mlDetectorEnabled) return
+        try {
+            val options = ObjectDetectorOptions.Builder()
+                .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
+                .enableMultipleObjects()
+                .build()
+            mlDetector = ObjectDetection.getClient(options)
+        } catch (_: Exception) {
+            mlDetectorEnabled = false
+        }
+    }
+
+    private fun detectMlKitCandidate(imageProxy: ImageProxy): Candidate? {
+        val detector = mlDetector ?: return null
+        if (!mlDetectorEnabled) return null
+        val mediaImage = imageProxy.image ?: return null
+
+        return try {
+            val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+            val objects = Tasks.await(detector.process(inputImage), 8, TimeUnit.MILLISECONDS)
+            val best = objects.maxByOrNull { obj ->
+                val box = obj.boundingBox
+                val w = box.width().toFloat().coerceAtLeast(1f)
+                val h = box.height().toFloat().coerceAtLeast(1f)
+                val aspect = (1f - abs((w / h) - 1f)).coerceIn(0f, 1f)
+                val radius = min(w, h) * 0.5f
+                val cx = box.exactCenterX()
+                val cy = box.exactCenterY()
+                val downR = radius / DOWNSAMPLE
+                val whiteness = measureWhiteness((cx / DOWNSAMPLE).toInt(), (cy / DOWNSAMPLE).toInt(), downR)
+                val contrast = sampleContrast((cx / DOWNSAMPLE).toInt(), (cy / DOWNSAMPLE).toInt(), downR)
+                val contrastScore = (contrast / 42f).coerceIn(0f, 1f)
+                (aspect * 0.45f + whiteness * 0.35f + contrastScore * 0.20f)
+            } ?: return null
+
+            val box = best.boundingBox
+            val w = box.width().toFloat().coerceAtLeast(1f)
+            val h = box.height().toFloat().coerceAtLeast(1f)
+            val radius = min(w, h) * 0.5f
+            if (radius < profile.minBallRadius || radius > profile.maxBallRadius * 1.4f) return null
+
+            val cx = box.exactCenterX()
+            val cy = box.exactCenterY()
+            val aspect = (1f - abs((w / h) - 1f)).coerceIn(0f, 1f)
+            val downR = radius / DOWNSAMPLE
+            val whiteness = measureWhiteness((cx / DOWNSAMPLE).toInt(), (cy / DOWNSAMPLE).toInt(), downR)
+            val contrast = sampleContrast((cx / DOWNSAMPLE).toInt(), (cy / DOWNSAMPLE).toInt(), downR)
+            val contrastScore = (contrast / 42f).coerceIn(0f, 1f)
+            val confidence = (aspect * 0.45f + whiteness * 0.35f + contrastScore * 0.20f).coerceIn(0f, 1f)
+            Candidate(cx, cy, radius, aspect, contrast, confidence)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun chooseBestCandidate(cvCandidate: Candidate?, mlCandidate: Candidate?): Candidate? {
+        if (cvCandidate == null) return mlCandidate
+        if (mlCandidate == null) return cvCandidate
+
+        return when (trackerMode) {
+            TrackerMode.SEARCHING -> if (mlCandidate.confidence >= cvCandidate.confidence + 0.08f) mlCandidate else cvCandidate
+            TrackerMode.LOCKED -> if (mlCandidate.confidence >= cvCandidate.confidence + 0.05f) mlCandidate else cvCandidate
+            TrackerMode.TRACKING_LAUNCH -> if (mlCandidate.confidence >= cvCandidate.confidence + 0.12f) mlCandidate else cvCandidate
+        }
+    }
+
+    private fun sampleContrast(cx: Int, cy: Int, radiusDown: Float): Float {
+        val innerR = max(1, (radiusDown * 0.5f).toInt())
+        val outerR = max(innerR + 2, (radiusDown * 1.6f).toInt())
+        var innerSum = 0f
+        var innerCount = 0
+        var outerSum = 0f
+        var outerCount = 0
+
+        for (y in cy - outerR..cy + outerR) {
+            if (y !in 0 until downHeight) continue
+            for (x in cx - outerR..cx + outerR) {
+                if (x !in 0 until downWidth) continue
+                val dx = x - cx
+                val dy = y - cy
+                val d2 = dx * dx + dy * dy
+                val idx = y * downWidth + x
+                if (d2 <= innerR * innerR) {
+                    innerSum += currentLuma[idx]
+                    innerCount++
+                } else if (d2 <= outerR * outerR) {
+                    outerSum += currentLuma[idx]
+                    outerCount++
+                }
+            }
+        }
+
+        if (innerCount < 4 || outerCount < 8) return 0f
+        return (innerSum / innerCount) - (outerSum / outerCount)
     }
 
     private fun updateTrackerMode(candidate: Candidate) {
