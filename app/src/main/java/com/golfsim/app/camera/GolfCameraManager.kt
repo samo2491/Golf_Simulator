@@ -6,8 +6,11 @@ import android.graphics.PointF
 import android.hardware.camera2.CaptureRequest
 import android.util.Range
 import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.core.*
-import android.hardware.camera2.CameraMetadata
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -32,15 +35,17 @@ class GolfCameraManager(private val context: Context) {
 
     companion object {
         private const val TARGET_FPS = 120
-        private const val FRAME_HISTORY_SIZE = 160
-        private const val VELOCITY_WINDOW = 10
-        private const val MAX_GAP_FRAMES = 5
+        private const val FRAME_HISTORY_SIZE = 180
+        private const val VELOCITY_WINDOW = 12
+        private const val MAX_GAP_FRAMES = 4
         private const val CAMERA_HFOV_DEG = 77.0
 
         private const val DOWNSAMPLE = 2
-        private const val BG_ALPHA = 0.06f
-        private const val MOTION_MIN_DELTA = 14f
-        private const val LUMA_PERCENTILE = 0.84f
+        private const val BG_ALPHA = 0.045f
+        private const val MOTION_MIN_DELTA = 12f
+        private const val LUMA_PERCENTILE = 0.86f
+        private const val LOCK_STABILITY_FRAMES = 6
+        private const val LOCK_ROI_MULTIPLIER = 3.8f
     }
 
     private val _trackingState = MutableStateFlow<TrackingState>(TrackingState.Idle)
@@ -70,6 +75,12 @@ class GolfCameraManager(private val context: Context) {
         data class Error(val message: String) : TrackingState()
     }
 
+    private enum class TrackerMode {
+        SEARCHING,
+        LOCKED,
+        TRACKING_LAUNCH
+    }
+
     @Volatile private var profile = CalibrationProfile()
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -79,6 +90,8 @@ class GolfCameraManager(private val context: Context) {
     private var isCapturing = false
     private var motionFrameCount = 0
     private var gapFrameCount = 0
+    private var stableLockFrames = 0
+    private var trackerMode = TrackerMode.SEARCHING
 
     @Volatile private var lastYData: ByteArray? = null
     @Volatile private var lastFrameWidth = 1920
@@ -108,6 +121,9 @@ class GolfCameraManager(private val context: Context) {
 
     fun setManualBallHint(normX: Float, normY: Float) {
         profile = profile.copy(manualHintX = normX, manualHintY = normY, useManualHint = true)
+        trackerMode = TrackerMode.SEARCHING
+        stableLockFrames = 0
+        kalmanInitialized = false
     }
 
     suspend fun autoDetectBrightness(): Int {
@@ -180,6 +196,8 @@ class GolfCameraManager(private val context: Context) {
         synchronized(ballHistory) { ballHistory.clear() }
         motionFrameCount = 0
         gapFrameCount = 0
+        stableLockFrames = 0
+        trackerMode = TrackerMode.SEARCHING
         kalmanInitialized = false
         _swingDetected.value = false
         _shotSnapshot.value = null
@@ -197,6 +215,8 @@ class GolfCameraManager(private val context: Context) {
         synchronized(ballHistory) { ballHistory.clear() }
         motionFrameCount = 0
         gapFrameCount = 0
+        stableLockFrames = 0
+        trackerMode = TrackerMode.SEARCHING
         kalmanInitialized = false
         _swingDetected.value = false
         _detectedBallPositions.value = emptyList()
@@ -237,7 +257,7 @@ class GolfCameraManager(private val context: Context) {
             val filtered = kalmanUpdate(candidate.cx, candidate.cy)
             val pos = BallPosition(filtered.x, filtered.y, now)
 
-            if (isCapturing) {
+            if (isCapturing && trackerMode == TrackerMode.TRACKING_LAUNCH) {
                 synchronized(ballHistory) {
                     ballHistory.add(pos)
                     if (ballHistory.size > FRAME_HISTORY_SIZE) ballHistory.removeAt(0)
@@ -247,22 +267,60 @@ class GolfCameraManager(private val context: Context) {
                 checkForSwing()
             }
 
+            updateTrackerMode(candidate)
             _ballRadius.value = candidate.radius
             _trackingState.value = TrackingState.BallDetected(filtered.x, filtered.y, candidate.radius, candidate.confidence)
         } else {
-            if (kalmanInitialized && gapFrameCount < MAX_GAP_FRAMES) {
-                gapFrameCount++
-                kalmanX += kalmanVx
-                kalmanY += kalmanVy
-                val predicted = BallPosition(kalmanX, kalmanY, now)
-                if (isCapturing) synchronized(ballHistory) { ballHistory.add(predicted) }
-                _trackingState.value = TrackingState.BallDetected(kalmanX, kalmanY, _ballRadius.value, 0.20f)
-            } else {
-                kalmanInitialized = false
-                if (!isCapturing) _trackingState.value = TrackingState.WaitingForBall
-            }
+            handleLostTracking(now)
         }
+
         imageProxy.close()
+    }
+
+    private fun updateTrackerMode(candidate: Candidate) {
+        when (trackerMode) {
+            TrackerMode.SEARCHING -> {
+                stableLockFrames = if (candidate.confidence > 0.58f) stableLockFrames + 1 else 0
+                if (stableLockFrames >= LOCK_STABILITY_FRAMES) {
+                    trackerMode = TrackerMode.LOCKED
+                }
+            }
+
+            TrackerMode.LOCKED -> {
+                val speed = hypot(kalmanVx.toDouble(), kalmanVy.toDouble()).toFloat()
+                val launchVectorOk = kalmanVy < -1.2f || abs(kalmanVx) > 1.5f
+                if (speed >= profile.swingMotionThresholdPx * 0.75f && launchVectorOk) {
+                    trackerMode = TrackerMode.TRACKING_LAUNCH
+                    motionFrameCount = 0
+                    synchronized(ballHistory) { ballHistory.clear() }
+                }
+            }
+
+            TrackerMode.TRACKING_LAUNCH -> Unit
+        }
+    }
+
+    private fun handleLostTracking(now: Long) {
+        if (kalmanInitialized && gapFrameCount < MAX_GAP_FRAMES) {
+            gapFrameCount++
+            kalmanX += kalmanVx
+            kalmanY += kalmanVy
+            if (trackerMode == TrackerMode.TRACKING_LAUNCH && isCapturing) {
+                val predicted = BallPosition(kalmanX, kalmanY, now)
+                synchronized(ballHistory) {
+                    ballHistory.add(predicted)
+                    if (ballHistory.size > FRAME_HISTORY_SIZE) ballHistory.removeAt(0)
+                }
+                _detectedBallPositions.value = synchronized(ballHistory) { ballHistory.toList() }
+            }
+            _trackingState.value = TrackingState.BallDetected(kalmanX, kalmanY, _ballRadius.value, 0.20f)
+            return
+        }
+
+        kalmanInitialized = false
+        stableLockFrames = 0
+        trackerMode = if (isCapturing && trackerMode == TrackerMode.TRACKING_LAUNCH) TrackerMode.TRACKING_LAUNCH else TrackerMode.SEARCHING
+        if (!isCapturing) _trackingState.value = TrackingState.WaitingForBall
     }
 
     private fun ensureBuffers(width: Int, height: Int) {
@@ -323,7 +381,6 @@ class GolfCameraManager(private val context: Context) {
         val cx: Float,
         val cy: Float,
         val radius: Float,
-        val area: Float,
         val circularity: Float,
         val contrast: Float,
         val confidence: Float
@@ -336,11 +393,13 @@ class GolfCameraManager(private val context: Context) {
         val visited = BooleanArray(size)
         val candidates = ArrayList<Candidate>()
 
-        val minAreaDown = (profile.minBallRadius * profile.minBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 0.4f
-        val maxAreaDown = (profile.maxBallRadius * profile.maxBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 1.8f
+        val minAreaDown = (profile.minBallRadius * profile.minBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 0.35f
+        val maxAreaDown = (profile.maxBallRadius * profile.maxBallRadius * PI / (DOWNSAMPLE * DOWNSAMPLE)).toFloat() * 2.2f
 
-        for (y in 1 until downHeight - 1) {
-            for (x in 1 until downWidth - 1) {
+        val roi = buildRoi(frameWidth, frameHeight)
+
+        for (y in max(1, roi.top) until min(downHeight - 1, roi.bottom)) {
+            for (x in max(1, roi.left) until min(downWidth - 1, roi.right)) {
                 val idx = y * downWidth + x
                 if (visited[idx] || !brightMask[idx]) continue
 
@@ -360,17 +419,45 @@ class GolfCameraManager(private val context: Context) {
                 val predY = kalmanY + kalmanVy
                 candidates.maxByOrNull { c ->
                     val distancePenalty = (hypot((c.cx - predX).toDouble(), (c.cy - predY).toDouble()) / frameWidth).toFloat()
-                    c.confidence - distancePenalty
+                    c.confidence - distancePenalty * 0.9f
                 }
             }
+
             hintedX != null && hintedY != null -> {
                 candidates.maxByOrNull { c ->
                     val distancePenalty = (hypot((c.cx - hintedX).toDouble(), (c.cy - hintedY).toDouble()) / frameWidth).toFloat()
-                    c.confidence - distancePenalty * 0.5f
+                    c.confidence - distancePenalty * 0.7f
                 }
             }
+
             else -> candidates.maxByOrNull { it.confidence }
         }
+    }
+
+    private data class Roi(val left: Int, val top: Int, val right: Int, val bottom: Int)
+
+    private fun buildRoi(frameWidth: Int, frameHeight: Int): Roi {
+        val full = Roi(0, 0, downWidth, downHeight)
+        if (!kalmanInitialized && !profile.useManualHint) return full
+
+        val centerX = when {
+            kalmanInitialized -> (kalmanX / DOWNSAMPLE).toInt()
+            else -> ((profile.manualHintX * frameWidth) / DOWNSAMPLE).toInt()
+        }
+        val centerY = when {
+            kalmanInitialized -> (kalmanY / DOWNSAMPLE).toInt()
+            else -> ((profile.manualHintY * frameHeight) / DOWNSAMPLE).toInt()
+        }
+
+        val radiusPx = max(_ballRadius.value, profile.minBallRadius.toFloat())
+        val halfSize = (radiusPx * LOCK_ROI_MULTIPLIER / DOWNSAMPLE).toInt().coerceAtLeast(24)
+
+        return Roi(
+            left = (centerX - halfSize).coerceAtLeast(0),
+            top = (centerY - halfSize).coerceAtLeast(0),
+            right = (centerX + halfSize).coerceAtMost(downWidth),
+            bottom = (centerY + halfSize).coerceAtMost(downHeight)
+        )
     }
 
     private fun collectComponent(
@@ -429,7 +516,7 @@ class GolfCameraManager(private val context: Context) {
                         continue
                     }
                     val nIdx = ny * downWidth + nx
-                    val active = brightMask[nIdx] && motionMask[nIdx]
+                    val active = brightMask[nIdx] && (motionMask[nIdx] || trackerMode == TrackerMode.SEARCHING)
                     if (!active) exposedSides++
                     if (!visited[nIdx] && active) {
                         visited[nIdx] = true
@@ -449,15 +536,15 @@ class GolfCameraManager(private val context: Context) {
 
         val perimeter = max(1f, edgeCount / 2f)
         val circularity = ((4f * PI.toFloat() * area) / (perimeter * perimeter)).coerceIn(0f, 1.2f)
-        if (circularity < profile.circularityThreshold * 0.85f) return null
+        if (circularity < profile.circularityThreshold * 0.8f) return null
 
         val bboxW = maxX - minX + 1
         val bboxH = maxY - minY + 1
         val aspectPenalty = abs((bboxW.toFloat() / max(1, bboxH)) - 1f)
 
         val contrast = ((lumaSum / pixelCount) - (bgSum / pixelCount)).toFloat().coerceAtLeast(0f)
-        val contrastScore = (contrast / 40f).coerceIn(0f, 1f)
-        val roundnessScore = (1f - min(1f, aspectPenalty + abs(circularity - 1f) * 0.7f)).coerceIn(0f, 1f)
+        val contrastScore = (contrast / 42f).coerceIn(0f, 1f)
+        val roundnessScore = (1f - min(1f, aspectPenalty + abs(circularity - 1f) * 0.75f)).coerceIn(0f, 1f)
 
         var motionFraction = 0f
         for (y in minY..maxY) {
@@ -468,13 +555,13 @@ class GolfCameraManager(private val context: Context) {
         }
         val motionScore = (motionFraction / max(1f, bboxW * bboxH.toFloat())).coerceIn(0f, 1f)
 
-        val confidence = (roundnessScore * 0.45f + contrastScore * 0.35f + motionScore * 0.20f).coerceIn(0f, 1f)
+        val confidence = (roundnessScore * 0.5f + contrastScore * 0.35f + motionScore * 0.15f).coerceIn(0f, 1f)
 
         val fullX = centerXDown * DOWNSAMPLE
         val fullY = centerYDown * DOWNSAMPLE
         val fullRadius = radiusDown * DOWNSAMPLE
 
-        return Candidate(fullX, fullY, fullRadius, area * DOWNSAMPLE * DOWNSAMPLE, circularity, contrast, confidence)
+        return Candidate(fullX, fullY, fullRadius, circularity, contrast, confidence)
     }
 
     private fun kalmanUpdate(measX: Float, measY: Float): PointF {
